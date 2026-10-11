@@ -167,7 +167,6 @@ def normalize_title(value):
     return text
 
 
-
 # Employees
 def clean_employees(path):
     sheets = pd.read_excel(path, sheet_name=None, dtype=object, keep_default_na=False)
@@ -394,7 +393,17 @@ def make_plots(emp, jobs, target):
         save(fig, f"05_{key}_histogram.png")
 
 
-# Summaries
+# Output and summaries
+def save_excel(obj, path):
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        obj["clean"].to_excel(writer, sheet_name="CleanData", index=False)
+        obj["flags"].to_excel(writer, sheet_name="Audit", index=False)
+        for ws in writer.book.worksheets:
+            ws.freeze_panes = "A2"
+            for col in ws.columns:
+                ws.column_dimensions[col[0].column_letter].width = 18
+
+
 def compare(obj, columns, use_iqr=False):
     """Step 5: mean and std before/after cleaning, plus the pre-imputation IQR fences."""
     rows = {}
@@ -412,6 +421,7 @@ def compare(obj, columns, use_iqr=False):
 def main():
     pd.set_option("display.width", 160)
     pd.set_option("display.max_columns", 20)
+    OUTPUT.mkdir(exist_ok=True)
 
     emp = clean_employees(INPUT / "employees.xlsx")
     jobs = clean_jobs(INPUT / "job_postings.csv")
@@ -431,10 +441,12 @@ def main():
     print(compare(emp, ["Age", "Salary"]))
     print(compare(jobs, JOB_NUMERIC, use_iqr=True))
 
-    OUTPUT.mkdir(exist_ok=True)
+    save_excel(emp, OUTPUT / "employees_clean.xlsx")
+    save_excel(jobs, OUTPUT / "job_postings_clean.xlsx")
     make_plots(emp, jobs, OUTPUT / "charts")
     print(f"\nEmployees: {len(emp['raw'])} -> {len(emp['clean'])} rows")
     print(f"Job postings: {len(jobs['raw'])} -> {len(jobs['clean'])} rows")
+    print(f"All checks passed. Output: {OUTPUT}")
 
 
 if __name__ == "__main__":

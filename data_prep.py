@@ -133,6 +133,32 @@ def balanced_hotdeck(series, groups=None, min_donors=20, seed=42):
     return result
 
 
+def canonical_place(value):
+    """'OSAKA, Japan' -> 'Osaka, Japan'; US state codes in upper case."""
+    if value is pd.NA or pd.isna(value) or value == "United States":
+        return value
+    pieces = str(value).rsplit(",", 1)
+    if len(pieces) != 2:
+        return str(value)
+    city, region = pieces[0].strip().title(), pieces[1].strip()
+    city = re.sub(r"\bMc ?[Ll]ean\b", "McLean", city)
+    return f"{city}, {region.upper() if re.fullmatch('[A-Za-z]{2}', region) else region.title()}"
+
+
+def normalize_title(value):
+    """Standardize job titles: Sr -> Senior, Jr -> Junior, acronyms in upper case."""
+    if value is pd.NA or pd.isna(value):
+        return pd.NA
+    text = str(value)
+    if text.isupper():
+        text = text.title()
+    text = re.sub(r"\bsr\b\.?", "Senior", text, flags=re.I)
+    text = re.sub(r"\bjr\b\.?", "Junior", text, flags=re.I)
+    for token in ["AI", "ML", "NLP", "BI", "SQL", "AWS", "TS", "SCI", "NGS", "IT", "USA", "RFP", "ELISA"]:
+        text = re.sub(r"\b" + token + r"\b", token, text, flags=re.I)
+    return text
+
+
 
 # Employees
 def clean_employees(path):
@@ -193,14 +219,62 @@ def clean_employees(path):
     return {"raw": raw, "baseline": baseline, "clean": d, "flags": flags, "median_std": median_std}
 
 
+# Job postings
+def clean_jobs(path):
+    # Separator is ';'. Multi-line descriptions inside quotes are read as one record.
+    raw = pd.read_csv(path, sep=";", encoding="utf-8-sig", dtype=object, keep_default_na=False)
+    assert len(raw.columns) == 27, "Check the CSV separator."
+    d = raw.loc[~raw.duplicated()].copy()  # Drop the 12 exact duplicates (first copy kept).
+
+    # Text: whitespace and hidden missing values (-1, Unknown, na ...) -> NaN.
+    for c in d:
+        d[c] = d[c].map(lambda v: norm_text(v, c == "Job Description"))
+    d["Job Title"] = d["Job Title"].map(normalize_title)
+    for c in ["Location", "Headquarters"]:
+        d[c] = d[c].map(canonical_place)
+
+    # Broken headquarters codes like 'New York, 061' are fixed from the city-state pairs in Location.
+    states = d.Location.str.extract(r", ([A-Z]{2})$", expand=False)
+    cities = d.Location.str.replace(r", [A-Z]{2}$", "", regex=True)
+    pairs = pd.DataFrame({"city": cities, "state": states}).dropna().groupby("city").state
+    city_to_state = pairs.first()[pairs.nunique().eq(1)]
+    broken = d.Headquarters.fillna("").str.contains(r", \d+$")
+    for idx in d.index[broken]:
+        city = str(d.at[idx, "Headquarters"]).rsplit(",", 1)[0]
+        state = city_to_state.get(city)
+        d.at[idx, "Headquarters"] = f"{city}, {state}" if state is not None else pd.NA
+
+    # Numeric types plus scale and validity fixes.
+    for c in JOB_NUMERIC + ["same_state"] + SKILLS:
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    positive = d.Rating[d.Rating.gt(0)]
+    if positive.between(10, 50).all():          # 38 -> 3.8 (lost decimal point)
+        d["Rating"] = d.Rating / 10
+    d["Rating"] = d.Rating.mask(~d.Rating.between(1, 5), np.nan)   # 0 = no rating
+    d["company_age"] = d.company_age.mask(d.company_age.lt(0), np.nan)
+    for c in ["min_salary", "max_salary"]:
+        d[c] = d[c].mask(d[c].le(0), np.nan)
+    assert not d.min_salary.gt(d.max_salary).any(), "Contradictory salary range."
+    d["avg_salary"] = (d.min_salary + d.max_salary) / 2   # Recompute the wrong averages.
+    text_range = d["Salary Estimate"].str.extract(r"^(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)$").astype(float)
+    assert np.allclose(text_range[0], d.min_salary) and np.allclose(text_range[1], d.max_salary)
+    d["job_state"] = states.fillna("US")
+
+    baseline = d.copy()  # Repaired, not yet imputed.
+    return {"raw": raw, "baseline": baseline, "clean": d}
+
+
 def main():
     pd.set_option("display.width", 160)
     pd.set_option("display.max_columns", 20)
 
     emp = clean_employees(INPUT / "employees.xlsx")
+    jobs = clean_jobs(INPUT / "job_postings.csv")
 
     print("=== 1-2. Exploration and missing values (raw data) ===")
     print("\nEmployees:\n", profile(emp["raw"]))
+    print("\nJob postings:\n", profile(jobs["raw"], rating_zero=True))
+    print(f"\nExact duplicate postings: {jobs['raw'].duplicated().sum()}")
 
     print("\n=== 3. Why not a median fill ===")
     for c, std in emp["median_std"].items():
@@ -208,6 +282,7 @@ def main():
         print(f"{c}: observed std {observed:,.2f} | median fill {std:,.2f} "
               f"({(1 - std / observed) * 100:.1f}% lower) | donor fill {emp['clean'][c].std():,.2f}")
     print(f"\nEmployees: {len(emp['raw'])} -> {len(emp['clean'])} rows")
+    print(f"Job postings: {len(jobs['raw'])} -> {len(jobs['clean'])} rows")
 
 
 if __name__ == "__main__":

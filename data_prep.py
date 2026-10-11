@@ -304,6 +304,11 @@ def clean_jobs(path):
         assert d[c].isin([0, 1]).all(), f"{c}: invalid skill flag."
         d[c] = d[c].astype("Int64")
 
+    # Outliers (IQR): original values are kept, capped analysis columns are added.
+    for c in ["avg_salary", "company_age"]:
+        s = numeric_summary(baseline[c])
+        flags[c + "_iqr_outlier"] = ((baseline[c] < s["lower"]) | (baseline[c] > s["upper"])).astype(int)
+        d[c + "_iqr"] = d[c].clip(max(0.0, s["lower"]), s["upper"])
     flags["state_unspecified"] = d.same_state.eq(UNSPECIFIED).astype(int)
 
     # Checks
@@ -313,6 +318,21 @@ def clean_jobs(path):
     assert d.job_state.str.fullmatch(r"[A-Z]{2}").all()
     assert np.allclose(d.loc[baseline.company_age.notna(), "company_age"], baseline.company_age.dropna())
     return {"raw": raw, "baseline": baseline, "clean": d, "flags": flags}
+
+
+# Summaries
+def compare(obj, columns, use_iqr=False):
+    """Step 5: mean and std before/after cleaning, plus the pre-imputation IQR fences."""
+    rows = {}
+    for c in columns:
+        before = numeric_summary(obj["baseline"][c])
+        col = c + "_iqr" if use_iqr and c + "_iqr" in obj["clean"] else c
+        after = numeric_summary(obj["clean"][col])
+        rows[col] = {"mean_before": before["mean"], "mean_after": after["mean"],
+                     "std_before": before["std"], "std_after": after["std"],
+                     "iqr_lower": before["lower"], "iqr_upper": before["upper"],
+                     "outliers": before["outliers"]}
+    return pd.DataFrame(rows).T.round(3)
 
 
 def main():
@@ -332,6 +352,11 @@ def main():
         observed = emp["baseline"][c].std()
         print(f"{c}: observed std {observed:,.2f} | median fill {std:,.2f} "
               f"({(1 - std / observed) * 100:.1f}% lower) | donor fill {emp['clean'][c].std():,.2f}")
+
+    print("\n=== 4-5. IQR fences and before/after comparison ===")
+    print(compare(emp, ["Age", "Salary"]))
+    print(compare(jobs, JOB_NUMERIC, use_iqr=True))
+
     print(f"\nEmployees: {len(emp['raw'])} -> {len(emp['clean'])} rows")
     print(f"Job postings: {len(jobs['raw'])} -> {len(jobs['clean'])} rows")
 

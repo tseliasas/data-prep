@@ -104,3 +104,57 @@ def numeric_summary(series):
     return {"n": len(s), "mean": s.mean(), "median": s.median(), "std": s.std(),
             "skew": s.skew(), "lower": lower, "upper": upper,
             "outliers": int(((s < lower) | (s > upper)).sum())}
+
+
+
+# Employees
+def clean_employees(path):
+    sheets = pd.read_excel(path, sheet_name=None, dtype=object, keep_default_na=False)
+    main = [v for v in sheets.values() if list(v.columns) == EMP_COLS]
+    packed = [v for v in sheets.values()
+              if len(v.columns) == 1 and str(v.columns[0]).split(",") == EMP_COLS]
+    assert len(main) == 1 and len(packed) == 1, "Expected two sheets were not found."
+    raw = main[0]
+    d = raw.copy()
+
+    # Scale error: on the first sheet ages run 200-600 and salaries lost their decimal point.
+    # The second sheet holds the same records as CSV text, with the decimal points intact.
+    # The fix is applied only if removing the point makes every value match the first sheet exactly.
+    ref = pd.DataFrame([next(csv.reader([str(v)])) for v in packed[0].iloc[:, 0]], columns=EMP_COLS)
+    for c in ["Name", "Gender", "City", "Department", "Email"]:
+        assert d[c].astype(str).equals(ref[c].astype(str)), "Sheets are not in the same order."
+    for c in ["Age", "Salary"]:
+        actual = pd.to_numeric(d[c], errors="coerce")
+        encoded = pd.to_numeric(ref[c].str.replace(".", "", regex=False), errors="coerce")
+        assert (actual.eq(encoded) | (actual.isna() & encoded.isna())).all(), f"{c}: scale fix could not be verified."
+        d[c] = pd.to_numeric(ref[c], errors="coerce")
+
+    # Text standardization: whitespace, letter case, typos.
+    for c in ["Name", "Gender", "City", "Department", "Email"]:
+        d[c] = d[c].map(norm_text)
+    d["City"] = d.City.str.title()  # lahore -> Lahore
+    departments = {"hr": "HR", "it": "IT", "sales": "Sales", "finance": "Finance", "marketing": "Marketing"}
+    d["Department"] = d.Department.map(lambda x: departments.get(str(x).casefold(), x))
+    d["Email"] = d.Email.str.lower().str.replace(r"@gamil\.com$", "@gmail.com", regex=True)
+    d["Email"] = d.Email.mask(~d.Email.str.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", na=False), pd.NA)
+    # Validity: impossible ages and salaries count as missing.
+    d["Age"] = d.Age.mask(~d.Age.between(18, 120), np.nan)
+    d["Salary"] = d.Salary.mask(d.Salary.le(0), np.nan)
+
+    baseline = d.copy()  # Scale fixed, not yet imputed (used for before/after comparison).
+    return {"raw": raw, "baseline": baseline, "clean": d}
+
+
+def main():
+    pd.set_option("display.width", 160)
+    pd.set_option("display.max_columns", 20)
+
+    emp = clean_employees(INPUT / "employees.xlsx")
+
+    print("=== 1-2. Exploration and missing values (raw data) ===")
+    print("\nEmployees:\n", profile(emp["raw"]))
+    print(f"\nEmployees: {len(emp['raw'])} -> {len(emp['clean'])} rows")
+
+
+if __name__ == "__main__":
+    main()

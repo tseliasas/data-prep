@@ -106,6 +106,14 @@ def numeric_summary(series):
             "outliers": int(((s < lower) | (s > upper)).sum())}
 
 
+def same_company_values(df, column):
+    """If the same company's other postings have one consistent value, return it."""
+    valid = df.dropna(subset=[column, "Company Name"])
+    groups = valid.groupby("Company Name")[column]
+    lookup = groups.first()[groups.nunique().eq(1)]
+    return df["Company Name"].map(lookup)
+
+
 def balanced_hotdeck(series, groups=None, min_donors=20, seed=42):
     """Fill missing values by drawing from the observed distribution.
 
@@ -261,7 +269,50 @@ def clean_jobs(path):
     d["job_state"] = states.fillna("US")
 
     baseline = d.copy()  # Repaired, not yet imputed.
-    return {"raw": raw, "baseline": baseline, "clean": d}
+    flags = pd.DataFrame({"source_row": d.index + 2}, index=d.index)
+    for c in ["Rating", "company_age"]:
+        flags[c + "_imputed"] = d[c].isna().astype(int)
+
+    # Imputation 1: from the same company's consistent postings, and from unambiguous Industry -> Sector pairs.
+    categories = ["Headquarters", "Size", "Type of ownership", "Industry", "Sector", "Revenue"]
+    for c in categories + ["Rating", "company_age"]:
+        d[c] = d[c].fillna(same_company_values(d, c))
+    known = d.dropna(subset=["Industry", "Sector"]).groupby("Industry").Sector
+    d["Sector"] = d.Sector.fillna(d.Industry.map(known.first()[known.nunique().eq(1)]))
+
+    # Imputation 2: median for Rating; median of the company-size group for right-skewed company_age.
+    d["Rating"] = d.Rating.fillna(baseline.Rating.median()).round(2)
+    age_groups = baseline.groupby("Size").company_age.agg(["median", "count"])
+    age_by_size = age_groups.loc[age_groups["count"].ge(10), "median"]
+    d["company_age"] = d.company_age.fillna(d.Size.map(age_by_size).fillna(baseline.company_age.median()))
+
+    # Imputation 3: categories get an explicit label instead of the most frequent value.
+    for c in categories:
+        d[c] = d[c].fillna(UNSPECIFIED)
+    d["job_simp"] = d.job_simp.fillna("Not classified")
+    d["seniority"] = d.seniority.fillna(UNSPECIFIED).replace({"senior": "Senior", "jr": "Junior"})
+
+    # same_state: compare the job's state with the headquarters' state; a foreign HQ counts as different.
+    hq_state = d.Headquarters.str.extract(r", ([A-Z]{2})$", expand=False)
+    foreign_hq = d.Headquarters.ne(UNSPECIFIED) & hq_state.isna()
+    comparable = states.notna() & hq_state.notna()
+    same = pd.Series(UNSPECIFIED, index=d.index, dtype=object)
+    same[comparable] = np.where(states[comparable].eq(hq_state[comparable]), "Same state", "Different state")
+    same[states.notna() & foreign_hq] = "Different state"
+    d["same_state"] = same
+    for c in SKILLS:
+        assert d[c].isin([0, 1]).all(), f"{c}: invalid skill flag."
+        d[c] = d[c].astype("Int64")
+
+    flags["state_unspecified"] = d.same_state.eq(UNSPECIFIED).astype(int)
+
+    # Checks
+    assert not d.duplicated().any() and not d.isna().any().any()
+    assert d.Rating.between(1, 5).all() and d.company_age.ge(0).all()
+    assert np.allclose(d.avg_salary, (d.min_salary + d.max_salary) / 2)
+    assert d.job_state.str.fullmatch(r"[A-Z]{2}").all()
+    assert np.allclose(d.loc[baseline.company_age.notna(), "company_age"], baseline.company_age.dropna())
+    return {"raw": raw, "baseline": baseline, "clean": d, "flags": flags}
 
 
 def main():

@@ -106,6 +106,33 @@ def numeric_summary(series):
             "outliers": int(((s < lower) | (s > upper)).sum())}
 
 
+def balanced_hotdeck(series, groups=None, min_donors=20, seed=42):
+    """Fill missing values by drawing from the observed distribution.
+
+    When half the values are missing, filling them all with the median piles
+    everything onto one point and shrinks the std. Instead, this picks as many
+    evenly spaced quantiles as there are missing cells ('nearest' = only values
+    that were actually observed) and shuffles them with a fixed seed so the
+    result is reproducible. If a group has fewer than 20 donors, the whole
+    column is used.
+    """
+    original = pd.to_numeric(series, errors="coerce").astype(float)
+    result = original.copy()
+    labels = pd.Series("All", index=series.index) if groups is None else groups.fillna("Unknown")
+    rng = np.random.default_rng(seed)
+    for group in pd.unique(labels):
+        missing = labels.eq(group) & original.isna()
+        if not missing.any():
+            continue
+        donors = original[labels.eq(group)].dropna()
+        if len(donors) < min_donors:
+            donors = original.dropna()
+        positions = (np.arange(missing.sum()) + .5) / missing.sum()
+        values = np.quantile(donors.to_numpy(), positions, method="nearest")
+        result[missing] = rng.permutation(values)
+    return result
+
+
 
 # Employees
 def clean_employees(path):
@@ -142,7 +169,28 @@ def clean_employees(path):
     d["Salary"] = d.Salary.mask(d.Salary.le(0), np.nan)
 
     baseline = d.copy()  # Scale fixed, not yet imputed (used for before/after comparison).
-    return {"raw": raw, "baseline": baseline, "clean": d}
+    flags = pd.DataFrame({"source_row": d.index + 2,
+                          "Age_imputed": d.Age.isna().astype(int),
+                          "Salary_imputed": d.Salary.isna().astype(int),
+                          "Email_repeated": d.Email.duplicated(keep=False).astype(int)})
+
+    # Justification: how much a median fill would shrink the std.
+    median_std = {"Age": d.Age.fillna(d.Age.median()).std(),
+                  "Salary": d.Salary.fillna(d.Salary.median()).std()}
+
+    # Imputation: age from all employees, salary from donors in the same department.
+    d["Age"] = balanced_hotdeck(d.Age).astype("Int64")
+    d["Salary"] = balanced_hotdeck(d.Salary, d.Department).round(2)
+    for c in ["Name", "Gender", "City", "Department", "Email"]:
+        d[c] = d[c].fillna(UNSPECIFIED)
+
+    # Checks
+    assert len(d) == len(raw) and not d.isna().any().any()
+    assert d.Age.between(18, 120).all() and d.Salary.gt(0).all()
+    assert d.City.nunique() == 5 and d.Department.nunique() == 5
+    assert d.loc[baseline.Age.notna(), "Age"].eq(baseline.Age.dropna()).all(), "Known ages changed."
+    assert np.allclose(d.loc[baseline.Salary.notna(), "Salary"], baseline.Salary.dropna()), "Known salaries changed."
+    return {"raw": raw, "baseline": baseline, "clean": d, "flags": flags, "median_std": median_std}
 
 
 def main():
@@ -153,6 +201,12 @@ def main():
 
     print("=== 1-2. Exploration and missing values (raw data) ===")
     print("\nEmployees:\n", profile(emp["raw"]))
+
+    print("\n=== 3. Why not a median fill ===")
+    for c, std in emp["median_std"].items():
+        observed = emp["baseline"][c].std()
+        print(f"{c}: observed std {observed:,.2f} | median fill {std:,.2f} "
+              f"({(1 - std / observed) * 100:.1f}% lower) | donor fill {emp['clean'][c].std():,.2f}")
     print(f"\nEmployees: {len(emp['raw'])} -> {len(emp['clean'])} rows")
 
 

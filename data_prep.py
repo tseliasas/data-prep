@@ -320,6 +320,80 @@ def clean_jobs(path):
     return {"raw": raw, "baseline": baseline, "clean": d, "flags": flags}
 
 
+# Charts
+def make_plots(emp, jobs, target):
+    target.mkdir(parents=True, exist_ok=True)
+    plt.rcParams.update({"font.size": 10, "axes.spines.top": False, "axes.spines.right": False})
+
+    def save(fig, name):
+        fig.savefig(target / name, dpi=200, bbox_inches="tight", facecolor="white")
+        plt.close(fig)
+
+    # Missing-value heatmaps (hidden missing values included).
+    for key, obj in [("employees", emp), ("job_postings", jobs)]:
+        mask = missing_mask(obj["raw"], key == "job_postings")
+        fig, ax = plt.subplots(figsize=(12 if key == "job_postings" else 8, 3.8))
+        ax.imshow(mask.to_numpy().astype(int), aspect="auto", interpolation="nearest",
+                  cmap=ListedColormap(["#E7EDF3", "#A64B35"]), vmin=0, vmax=1)
+        ax.set_xticks(range(mask.shape[1]), labels=mask.columns, rotation=65, ha="right", fontsize=8)
+        ax.set_ylabel("Source row")
+        ax.set_title("Employees" if key == "employees" else "Job postings")
+        ax.text(1, 1.025, "Red = missing   Light = observed", ha="right", transform=ax.transAxes, fontsize=9)
+        save(fig, f"01_{key}_missing_heatmap.png")
+
+    # Missing rate per column.
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4), gridspec_kw={"width_ratios": [1, 2]})
+    for ax, obj, title in zip(axes, [emp, jobs], ["Employees", "Job postings"]):
+        counts = missing_mask(obj["raw"], title == "Job postings").sum()
+        counts = counts[counts.gt(0)].sort_values()
+        pct = counts / len(obj["raw"]) * 100
+        ax.barh(pct.index, pct, color=COLOR_BEFORE)
+        for y, (n, p) in enumerate(zip(counts, pct)):
+            ax.text(p + 1, y, f"{n} ({p:.1f}%)", va="center", fontsize=8)
+        ax.set_xlim(0, max(pct.max() + 28, 80))
+        ax.set_xlabel("Missing (%)")
+        ax.set_title(title)
+    fig.tight_layout()
+    save(fig, "02_missing_rates.png")
+
+    # Box plots: observed values vs. after cleaning.
+    box = {"patch_artist": True, "boxprops": {"facecolor": "#BFD0E1"}, "medianprops": {"color": "#A64B35"}}
+    fig, axes = plt.subplots(1, 2, figsize=(10, 3.8))
+    for ax, c in zip(axes, ["Age", "Salary"]):
+        ax.boxplot([emp["baseline"][c].dropna(), emp["clean"][c]], tick_labels=["Observed", "Imputed"], **box)
+        ax.set_title(c)
+    fig.tight_layout()
+    save(fig, "03_employees_boxplot.png")
+
+    fig, axes = plt.subplots(1, 3, figsize=(11, 3.8))
+    for ax, c, title in zip(axes, ["Rating", "avg_salary", "company_age"], ["Company rating", "Average salary", "Company age"]):
+        after = jobs["clean"].get(c + "_iqr", jobs["clean"][c])
+        ax.boxplot([jobs["baseline"][c].dropna(), after], tick_labels=["Observed", "Cleaned"],
+                   flierprops={"markersize": 3}, **box)
+        ax.set_title(title)
+    fig.tight_layout()
+    save(fig, "04_job_postings_boxplot.png")
+
+    # Histograms as relative frequency, so groups of different sizes can be compared.
+    titles = {"Age": "Age", "Salary": "Salary", "Rating": "Company rating",
+              "avg_salary": "Average salary", "company_age": "Company age"}
+    for key, obj, columns in [("employees", emp, ["Age", "Salary"]),
+                              ("job_postings", jobs, ["Rating", "avg_salary", "company_age"])]:
+        fig, axes = plt.subplots(1, len(columns), figsize=(11, 3.7))
+        for ax, c in zip(axes, columns):
+            old = obj["baseline"][c].dropna().astype(float)
+            new = obj["clean"].get(c + "_iqr", obj["clean"][c]).astype(float)
+            bins = np.histogram_bin_edges(np.concatenate([old, new]), bins=16)
+            ax.hist(old, bins=bins, weights=np.ones(len(old)) / len(old), color=COLOR_BEFORE, alpha=.6, label="Observed")
+            ax.hist(new, bins=bins, weights=np.ones(len(new)) / len(new), color=COLOR_AFTER, alpha=.5, label="After cleaning")
+            ax.set_title(titles[c])
+            ax.set_ylabel("Relative frequency")
+            ax.legend(fontsize=8)
+            ax.tick_params(axis="x", labelrotation=30, labelsize=8)
+        fig.tight_layout()
+        save(fig, f"05_{key}_histogram.png")
+
+
 # Summaries
 def compare(obj, columns, use_iqr=False):
     """Step 5: mean and std before/after cleaning, plus the pre-imputation IQR fences."""
@@ -357,6 +431,8 @@ def main():
     print(compare(emp, ["Age", "Salary"]))
     print(compare(jobs, JOB_NUMERIC, use_iqr=True))
 
+    OUTPUT.mkdir(exist_ok=True)
+    make_plots(emp, jobs, OUTPUT / "charts")
     print(f"\nEmployees: {len(emp['raw'])} -> {len(emp['clean'])} rows")
     print(f"Job postings: {len(jobs['raw'])} -> {len(jobs['clean'])} rows")
 
